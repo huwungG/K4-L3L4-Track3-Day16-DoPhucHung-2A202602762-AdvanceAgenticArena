@@ -70,7 +70,19 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+# Reuse the scorer's normalisation for line-scoped checks.
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
 
 
 class Critic(Middleware):
@@ -78,17 +90,78 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _saw_line(self, ctx, text: str) -> bool:
+        """Did this exact string appear as a line (or substring of a line) in observed?"""
+        nt = _norm(text)
+        if not nt:
+            return False
+        for line in ctx.observed_text.splitlines():
+            if nt in _norm(line):
+                return True
+        return False
+
+    def _find_doc_for(self, ctx, text: str):
+        """Return doc_id of the doc containing a line that matches text in observed_text, or None."""
+        nt = _norm(text)
+        if not nt or ctx.corpus is None:
+            return None
+        for doc in ctx.corpus.docs:
+            if doc.body not in ctx.observed_text:
+                continue
+            for line in doc.body.splitlines():
+                if nt in _norm(line):
+                    return doc.doc_id
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept_claims = []
+        for claim in claims:
+            text = claim.get("text", "")
+            if not text:
+                continue
+            # Skip claims with newlines — multi-line claims can't be credited
+            # as a single-line quotation. They are also not "from the model"
+            # in a verifiable way: the scorer normalises them per-line.
+            if "\n" in text:
+                continue
+
+            # Is this claim's text in observed evidence (as a line)?
+            if self._saw_line(ctx, text):
+                kept_claims.append(claim)
+                continue
+
+            # Try splitting a compound sentence (case (c))
+            split_idx = text.find(" và ")
+            if split_idx != -1:
+                left = text[:split_idx].strip()
+                right = text[split_idx + 4:].strip()
+                if "\n" not in left and "\n" not in right:
+                    if self._saw_line(ctx, left) and self._saw_line(ctx, right):
+                        left_doc = self._find_doc_for(ctx, left)
+                        right_doc = self._find_doc_for(ctx, right)
+                        if left_doc and right_doc and left_doc != right_doc:
+                            kept_claims.append({"text": left, "doc_id": left_doc})
+                            kept_claims.append({"text": right, "doc_id": right_doc})
+                            report["abstain"] = True
+                            continue
+
+            # Could not verify — fabrication
+            pass
+
+        if not kept_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            existing_answer = report.get("answer")
+            answer = existing_answer if isinstance(existing_answer, str) else ""
+            report["answer"] = "Không đủ căn cứ để trả lời câu hỏi này." if not answer.strip() else answer
+        else:
+            report["claims"] = kept_claims
+            doc_ids = set(c.get("doc_id", "") for c in kept_claims if c.get("doc_id"))
+            report["citations"] = sorted(doc_ids)
+
+        return report

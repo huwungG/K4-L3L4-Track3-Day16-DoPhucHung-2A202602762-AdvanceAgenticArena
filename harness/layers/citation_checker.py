@@ -59,7 +59,20 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+import unicodedata
+
 from harness.middleware import Middleware
+
+# Reuse the scorer's normalisation: casefolded NFC + whitespace collapsed.
+# A claim supports a doc iff `norm(claim) in norm(line)` for some line.
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm(text: str) -> str:
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return _WS_RE.sub(" ", unicodedata.normalize("NFC", text).casefold()).strip()
 
 
 class CitationChecker(Middleware):
@@ -67,17 +80,62 @@ class CitationChecker(Middleware):
 
     name = "citation_checker"
 
+    def _supports(self, claim_text: str, body: str) -> bool:
+        """Does this document support this claim, AS A QUOTATION?
+
+        Same rule as `arena.scorer._supports`: a normalised claim must
+        be a substring of one normalised line.
+        """
+        nc = _norm(claim_text)
+        if not nc:
+            return False
+        for line in body.splitlines():
+            if nc in _norm(line):
+                return True
+        return False
+
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report
+
+        # Rebuild claims with corrected doc_ids
+        corrected_claims = []
+        for claim in claims:
+            text = claim.get("text", "")
+            if not text:
+                continue
+            old_doc_id = claim.get("doc_id", "")
+            doc = ctx.corpus.get(old_doc_id)
+
+            # Already correctly cited?
+            fixed = False
+            if doc is not None and self._supports(text, doc.body):
+                corrected_claims.append(claim)
+                fixed = True
+
+            # Try to find the real source in observed docs
+            if not fixed:
+                for doc_candidate in ctx.corpus.docs:
+                    # Only consider docs that were actually retrieved
+                    if doc_candidate.body not in ctx.observed_text:
+                        continue
+                    if self._supports(text, doc_candidate.body):
+                        corrected_claims.append({
+                            "text": claim.get("text"),
+                            "doc_id": doc_candidate.doc_id,
+                        })
+                        fixed = True
+                        break
+
+            # Not verifiable as a single-line citation — keep for critic
+            if not fixed:
+                corrected_claims.append(claim)
+
+        report["claims"] = corrected_claims
+
+        # Update citations to match the remaining claims
+        doc_ids = set(c.get("doc_id", "") for c in corrected_claims if c.get("doc_id"))
+        report["citations"] = sorted(doc_ids)
+
+        return report
